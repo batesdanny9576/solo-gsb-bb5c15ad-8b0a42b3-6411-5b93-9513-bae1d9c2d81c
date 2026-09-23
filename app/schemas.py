@@ -599,3 +599,96 @@ class MutationCoverageResponse(BaseModel):
     uncovered_paths: list[str] = Field(
         ..., description="未被样本覆盖的变异路径（存活变异体的 schema 指针，可能重复）"
     )
+
+
+# ---------------------------------------------------------------------------
+# POST /api/reference-diagnostics 引用依赖诊断（只读，不落库）
+# ---------------------------------------------------------------------------
+
+
+class ReferenceDiagnosticsRequest(BaseModel):
+    """POST /api/reference-diagnostics 请求体。"""
+
+    # schema_ 是为避开 BaseModel.schema() 保留方法；对外字段名仍为 schema
+    schema_: dict[str, Any] = Field(
+        ...,
+        alias="schema",
+        serialization_alias="schema",
+        description="待诊断的单份 JSON Schema（仅解析其内部本地 $ref）",
+    )
+
+    model_config = {"populate_by_name": True}
+
+
+class ReferenceEdge(BaseModel):
+    """一条可解析的本地引用边。"""
+
+    source: str = Field(..., description="声明 $ref 的 schema 节点位置（JSON Pointer，根为 #）")
+    ref: str = Field(..., description="$ref 原文（片段形式）")
+    target: str = Field(..., description="解析并规范化后的目标节点位置（JSON Pointer）")
+
+
+class InvalidReference(BaseModel):
+    """一条不可用的 $ref 及其定位与原因。"""
+
+    source: str = Field(..., description="声明该 $ref 的 schema 节点位置（JSON Pointer，根为 #）")
+    ref: str | None = Field(..., description="$ref 原文；非字符串取值时为 null")
+    reason: Literal[
+        "external_reference",
+        "name_fragment_unsupported",
+        "target_not_found",
+        "malformed_pointer",
+        "non_string_ref",
+    ] = Field(
+        ...,
+        description=(
+            "external_reference：非片段形式的外部 / 相对引用；"
+            "name_fragment_unsupported：#anchor 名称片段；"
+            "target_not_found：指针目标在文档内不存在；"
+            "malformed_pointer：非法 JSON Pointer 转义；"
+            "non_string_ref：$ref 不是字符串"
+        ),
+    )
+    message: str
+
+
+class UnreachableDef(BaseModel):
+    """一个从根侧不可达的 $defs 节点。"""
+
+    pointer: str = Field(..., description="$defs 节点位置（JSON Pointer）")
+    name: str = Field(..., description="节点在所属 $defs 容器内的键名")
+
+
+class ReferenceCycle(BaseModel):
+    """一条引用循环链（首尾相接，含自环）。"""
+
+    chain: list[str] = Field(
+        ...,
+        min_length=2,
+        description=(
+            "循环经过的节点指针链，首尾相接（末元素等于首元素）；"
+            "以链上最小指针旋转到链首，保证同一环表示唯一"
+        ),
+    )
+
+
+class ReferenceDiagnosticsCounts(BaseModel):
+    refs: int = Field(..., ge=0, description="$ref 出现总数（可解析边 + 不可用引用）")
+    edges: int = Field(..., ge=0, description="可解析的本地引用边数")
+    invalid_refs: int = Field(..., ge=0, description="不可用引用数")
+    unreachable_defs: int = Field(..., ge=0, description="不可达 $defs 节点数")
+    cycles: int = Field(..., ge=0, description="引用循环数（自环计一条）")
+
+
+class ReferenceDiagnosticsResponse(BaseModel):
+    """引用依赖诊断结果（接口只读，不持久化、不创建分析记录）。"""
+
+    counts: ReferenceDiagnosticsCounts
+    edges: list[ReferenceEdge] = Field(..., description="全部可解析引用边（按源指针排序）")
+    invalid_refs: list[InvalidReference] = Field(
+        ..., description="全部不可用引用（按源指针排序）"
+    )
+    unreachable_defs: list[UnreachableDef] = Field(
+        ..., description="从根侧不可达的 $defs 节点（按指针排序）"
+    )
+    cycles: list[ReferenceCycle] = Field(..., description="引用循环链（按链上指针排序）")

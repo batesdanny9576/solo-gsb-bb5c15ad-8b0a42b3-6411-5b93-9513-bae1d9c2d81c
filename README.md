@@ -17,8 +17,9 @@
 ```
 .
 ├── app/
-│   ├── main.py          # FastAPI 路由：创建分析、查询报告、基线对比、发布门禁、SARIF 导出、合规画像、样本回放、回放最小覆盖、变异覆盖评估
+│   ├── main.py          # FastAPI 路由：创建分析、查询报告、基线对比、发布门禁、SARIF 导出、合规画像、样本回放、回放最小覆盖、变异覆盖评估、$ref 引用依赖诊断
 │   ├── compat.py        # 兼容性分析引擎（递归比较 + 最小反例生成）
+│   ├── refgraph.py      # 单份 schema 的 $ref 引用依赖诊断（引用边 / 不可达 $defs / 循环链 / 无效目标，只读不落库）
 │   ├── profile.py       # 合规画像引擎（批量文档校验 + oneOf/anyOf 最深公共失败路径 + 稳定指纹归并）
 │   ├── replay.py        # 样本回放诊断（旧/新双版校验 + backward/forward 分类 + 失败归因到报告 issue）
 │   ├── coverage.py      # 回放样本最小覆盖（确定性贪心集合覆盖，复用回放校验与归因选择最少代表文档）
@@ -31,6 +32,7 @@
 │   └── schemas.py       # Pydantic 请求 / 响应模型
 ├── tests/
 │   ├── test_compat.py   # 引擎单元测试（含 if/then/else 条件分支用例）
+│   ├── test_refgraph.py # $ref 引用依赖诊断单元测试（引用边 / 不可达定义 / 循环 / 无效引用 / 确定性）
 │   ├── test_profile.py  # 合规画像引擎单元测试（最深公共失败路径 / 指纹 / 顺序无关）
 │   ├── test_replay.py   # 样本回放引擎单元测试（四向分类 / issue 归因 / 无法归因归并）
 │   ├── test_coverage.py # 回放最小覆盖引擎单元测试（贪心选择 / 并列排序 / 方向筛选 / 未覆盖 issue）
@@ -83,8 +85,35 @@ docker compose logs -f
 curl http://localhost:8000/health
 # {"status":"ok"}
 
-# 打开 Swagger UI 可直接调试全部接口（含变异覆盖评估）
+# 打开 Swagger UI 可直接调试全部接口（含引用依赖诊断、变异覆盖评估）
 # http://localhost:8000/docs
+```
+
+不需要先创建分析记录、只想检查一份 schema 的 `$ref` 引用结构时，可直接
+调用**引用依赖诊断**接口（只读、不落库；访问地址
+`http://localhost:8000/api/reference-diagnostics`）：
+
+```bash
+curl -s -X POST http://localhost:8000/api/reference-diagnostics \
+  -H "Content-Type: application/json" \
+  -d '{
+    "schema": {
+      "type": "object",
+      "properties": {
+        "name": {"$ref": "#/$defs/Name"},
+        "tree": {"$ref": "#/$defs/Node"},
+        "oops": {"$ref": "#/$defs/Missing"}
+      },
+      "$defs": {
+        "Name": {"type": "string"},
+        "Node": {
+          "type": "object",
+          "properties": {"child": {"$ref": "#/$defs/Node"}}
+        },
+        "Dead": {"type": "integer"}
+      }
+    }
+  }' | python3 -m json.tool
 ```
 
 启动后可用一条脚本快速走通"创建分析 → 变异覆盖评估"：
@@ -1136,6 +1165,135 @@ curl -X POST http://localhost:8000/api/analyses/1/mutation-coverage \
 
 入参为空列表、超过 5000 个文档、缺少 `documents` 字段、`max_per_rule`
 含未知规则名或负数（超过 10000）时返回 `422`。
+
+### `POST /api/reference-diagnostics` — `$ref` 引用依赖诊断
+
+接收**单份** JSON Schema，遍历其内部全部 `$ref`，按 **JSON Pointer
+（RFC 6901）在本文档内解析本地目标**，输出引用边、不可达的 `$defs`
+节点、循环链与无效目标的定位信息。接口为**纯只读**操作：**不创建
+分析记录、不写数据库**，也**绝不访问网络或外部文件**——只接受片段
+形式的本地引用（`#` 或 `#/...`）。
+
+请求体：
+
+| 字段     | 类型   | 必填 | 说明                                 |
+| -------- | ------ | ---- | ------------------------------------ |
+| `schema` | object | 是   | 待诊断的单份 JSON Schema（JSON 对象） |
+
+```bash
+curl -X POST http://localhost:8000/api/reference-diagnostics \
+  -H "Content-Type: application/json" \
+  -d '{
+    "schema": {
+      "type": "object",
+      "properties": {
+        "name": {"$ref": "#/$defs/Name"},
+        "tree": {"$ref": "#/$defs/Node"},
+        "root": {"$ref": "#"},
+        "bad":  {"$ref": "#/$defs/Missing"},
+        "ext":  {"$ref": "https://example.com/s.json#/$defs/X"}
+      },
+      "$defs": {
+        "Name": {"type": "string"},
+        "Node": {
+          "type": "object",
+          "properties": {"child": {"$ref": "#/$defs/Node"},
+                         "peer": {"$ref": "#/$defs/A"}}
+        },
+        "A": {"$ref": "#/$defs/B"},
+        "B": {"$ref": "#/$defs/A"},
+        "Orphan": {"type": "null"}
+      }
+    }
+  }'
+```
+
+响应（节选）：
+
+```json
+{
+  "counts": {
+    "refs": 9,
+    "edges": 7,
+    "invalid_refs": 2,
+    "unreachable_defs": 1,
+    "cycles": 3
+  },
+  "edges": [
+    { "source": "#/$defs/A", "ref": "#/$defs/B", "target": "#/$defs/B" },
+    { "source": "#/$defs/B", "ref": "#/$defs/A", "target": "#/$defs/A" },
+    { "source": "#/$defs/Node/properties/child", "ref": "#/$defs/Node", "target": "#/$defs/Node" },
+    { "source": "#/$defs/Node/properties/peer", "ref": "#/$defs/A", "target": "#/$defs/A" },
+    { "source": "#/properties/name", "ref": "#/$defs/Name", "target": "#/$defs/Name" },
+    { "source": "#/properties/root", "ref": "#", "target": "#" },
+    { "source": "#/properties/tree", "ref": "#/$defs/Node", "target": "#/$defs/Node" }
+  ],
+  "invalid_refs": [
+    {
+      "source": "#/properties/bad",
+      "ref": "#/$defs/Missing",
+      "reason": "target_not_found",
+      "message": "引用目标 #/$defs/Missing 在路径段 'Missing' 处不存在"
+    },
+    {
+      "source": "#/properties/ext",
+      "ref": "https://example.com/s.json#/$defs/X",
+      "reason": "external_reference",
+      "message": "仅接受片段形式的本地引用（# 或 #/...），不访问网络或外部文件"
+    }
+  ],
+  "unreachable_defs": [
+    { "pointer": "#/$defs/Orphan", "name": "Orphan" }
+  ],
+  "cycles": [
+    { "chain": ["#/$defs/A", "#/$defs/B", "#/$defs/A"] },
+    { "chain": ["#/$defs/Node", "#/$defs/Node"] },
+    { "chain": ["#/properties/root", "#"] }
+  ]
+}
+```
+
+响应字段：
+
+| 字段                              | 说明                                                                 |
+| --------------------------------- | -------------------------------------------------------------------- |
+| `counts.refs`                     | `$ref` 出现总数（可解析边数 + 无效引用数）                           |
+| `edges[]`                         | 可解析的本地引用边，按 `source` 排序                                 |
+| `edges[].source`                  | 声明该 `$ref` 的 schema 节点位置（JSON Pointer，根为 `#`）           |
+| `edges[].target`                  | 解析并**规范化**后的目标位置（`%2F` 解码、指针转义归一）             |
+| `invalid_refs[]`                  | 不可用引用的定位与原因，按 `source` 排序                             |
+| `unreachable_defs[]`              | 从根侧沿引用链**不可达**的 `$defs` 节点（死定义），按指针排序        |
+| `unreachable_defs[].pointer/name` | 节点位置与其所属 `$defs` 容器内的键名（含定义内嵌套 `$defs` 节点）   |
+| `cycles[].chain`                  | 循环链：首尾相接的节点指针链；以链上最小指针旋转到链首，唯一且确定    |
+
+`invalid_refs[].reason` 取值：
+
+| reason                       | 含义                                                                 |
+| ---------------------------- | -------------------------------------------------------------------- |
+| `external_reference`         | 非片段形式的引用（`http(s)://…`、相对文件路径、裸名称），**不会**去解析 |
+| `name_fragment_unsupported`  | `#anchor` 形式的名称片段（锚点）；仅支持 `#/...` 指针片段             |
+| `target_not_found`           | 指针在本文档内无法解析（键不存在 / 数组越界 / 前导零下标 / `-` 等）   |
+| `malformed_pointer`          | 非法 JSON Pointer 转义（`~` 后只能为 `0` 或 `1`）                     |
+| `non_string_ref`             | `$ref` 的值不是字符串                                                 |
+
+判定细则：
+
+- **只接受本地片段引用**：`#` 指向文档根，`#/a~1b` 等按 RFC 6901 解析；
+  支持 `~0` / `~1` 转义与 URI 百分号编码（`%2F` 解码后与 `~1` 归一）；
+- **可达性**：以"源在所有 `$defs` 节点之外（根侧结构）"的引用边为种子
+  做 BFS，再沿已到达定义**内部**发出的全部引用边传播；只能从其它死
+  定义间接到达、根侧引用链触达不到的节点进入 `unreachable_defs`；
+  定义内嵌套 `$defs` 的子节点同样参与判定（未被任何引用显式指向即为
+  死定义）；
+- **循环链**：定义节点取自身 `$ref` 优先的代表出边追踪成环，树节点
+  内部属性引用自身定义形成自环（`["#/$defs/Node", "#/$defs/Node"]`），
+  根侧节点引用 `#` 报告为回边；同一环只出现一次，结果与输入键顺序无关；
+- `enum` / `const` / `default` / `examples` 中的 `$ref` 是**实例数据**，
+  不计入引用图。
+
+提交的 schema 本身不合法时返回 `400`（与创建分析一致）；缺少 `schema`
+字段或其值不是 JSON 对象时返回 `422`。该接口不产生任何持久化记录，
+重复调用结果完全一致。
 
 ### `GET /health`
 

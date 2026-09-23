@@ -1156,3 +1156,105 @@ def test_mutation_coverage_missing_analysis_returns_404(client):
                        json={"documents": [{}]})
     assert resp.status_code == 404
     assert resp.json()["detail"] == "分析记录不存在"
+
+
+# ---------------------------------------------------------------------------
+# POST /api/reference-diagnostics 引用依赖诊断（只读，不落库）
+# ---------------------------------------------------------------------------
+
+
+REF_DIAG_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "name": {"$ref": "#/$defs/Name"},
+        "tree": {"$ref": "#/$defs/Node"},
+        "root": {"$ref": "#"},
+        "broken": {"$ref": "#/$defs/Missing"},
+        "remote": {"$ref": "https://example.com/s.json#/$defs/X"},
+        "anchor": {"$ref": "#plainName"},
+    },
+    "$defs": {
+        "Name": {"type": "string"},
+        "Node": {
+            "type": "object",
+            "properties": {"child": {"$ref": "#/$defs/Node"},
+                           "peer": {"$ref": "#/$defs/A"}},
+        },
+        "A": {"$ref": "#/$defs/B"},
+        "B": {"$ref": "#/$defs/A"},
+        "Orphan": {"type": "null"},
+    },
+}
+
+
+def test_reference_diagnostics_full_report(client):
+    resp = client.post("/api/reference-diagnostics", json={"schema": REF_DIAG_SCHEMA})
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+
+    counts = data["counts"]
+    assert counts["refs"] == 10
+    assert counts["edges"] == 7
+    assert counts["invalid_refs"] == 3
+    assert counts["unreachable_defs"] == 1
+    assert counts["cycles"] == 3
+
+    edges = {(e["source"], e["target"]) for e in data["edges"]}
+    assert ("#/properties/name", "#/$defs/Name") in edges
+    assert ("#/$defs/A", "#/$defs/B") in edges
+    assert ("#/$defs/B", "#/$defs/A") in edges
+    assert ("#/$defs/Node/properties/child", "#/$defs/Node") in edges
+    assert ("#/$defs/Node/properties/peer", "#/$defs/A") in edges
+    assert ("#/properties/root", "#") in edges
+
+    reasons = {item["source"]: item["reason"] for item in data["invalid_refs"]}
+    assert reasons["#/properties/broken"] == "target_not_found"
+    assert reasons["#/properties/remote"] == "external_reference"
+    assert reasons["#/properties/anchor"] == "name_fragment_unsupported"
+
+    assert [d["name"] for d in data["unreachable_defs"]] == ["Orphan"]
+
+    chains = [c["chain"] for c in data["cycles"]]
+    assert ["#/$defs/A", "#/$defs/B", "#/$defs/A"] in chains
+    assert ["#/$defs/Node", "#/$defs/Node"] in chains
+    # 根侧节点引用文档根 #：沿根侧子树天然闭合，报告 source -> # 的回边
+    assert ["#/properties/root", "#"] in chains
+    for chain in chains:
+        if len(chain) > 2:
+            assert chain[0] == chain[-1]  # 定义间的环首尾相接
+
+
+def test_reference_diagnostics_clean_schema(client):
+    resp = client.post("/api/reference-diagnostics", json={
+        "schema": {
+            "type": "object",
+            "properties": {"a": {"$ref": "#/$defs/A"}},
+            "$defs": {"A": {"type": "string"}, "Orphan": {"type": "null"}},
+        }
+    })
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["counts"]["invalid_refs"] == 0
+    assert data["counts"]["cycles"] == 0
+    assert [d["name"] for d in data["unreachable_defs"]] == ["Orphan"]
+
+
+def test_reference_diagnostics_rejects_invalid_schema_with_400(client):
+    resp = client.post("/api/reference-diagnostics", json={"schema": {"type": "nope"}})
+    assert resp.status_code == 400
+    assert resp.json()["detail"]["field"] == "schema"
+
+
+def test_reference_diagnostics_validation_errors(client):
+    # 缺少 schema 字段 -> 422
+    assert client.post("/api/reference-diagnostics", json={}).status_code == 422
+    # schema 非对象 -> 422
+    assert client.post("/api/reference-diagnostics", json={"schema": []}).status_code == 422
+
+
+def test_reference_diagnostics_is_readonly(client):
+    before = client.get("/api/analyses").json()["total"]
+    resp = client.post("/api/reference-diagnostics", json={"schema": REF_DIAG_SCHEMA})
+    assert resp.status_code == 200
+    after = client.get("/api/analyses").json()["total"]
+    assert after == before

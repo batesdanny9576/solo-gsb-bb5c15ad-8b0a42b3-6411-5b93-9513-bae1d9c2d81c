@@ -7,7 +7,7 @@ from jsonschema.exceptions import SchemaError
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app import compat, compare, coverage, gate, mutation, profile, replay, sarif
+from app import compat, compare, coverage, gate, mutation, profile, refgraph, replay, sarif
 from app.database import get_db, init_db
 from app.models import Analysis, AnalysisProfile
 from app.schemas import (
@@ -23,6 +23,8 @@ from app.schemas import (
     ProfileCreate,
     ProfileListResponse,
     ProfileResponse,
+    ReferenceDiagnosticsRequest,
+    ReferenceDiagnosticsResponse,
     ReplayRequest,
     ReplayResponse,
     ReplayCoverageRequest,
@@ -55,6 +57,30 @@ def root():
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+# ---------------------------------------------------------------------------
+# 引用依赖诊断（单份 schema 的本地 $ref 分析；只读，不创建分析记录）
+# ---------------------------------------------------------------------------
+
+
+@app.post(
+    "/api/reference-diagnostics",
+    response_model=ReferenceDiagnosticsResponse,
+    tags=["reference-diagnostics"],
+    summary="单份 JSON Schema 的 $ref 引用依赖诊断",
+)
+def diagnose_references(payload: ReferenceDiagnosticsRequest):
+    # 只遍历 schema 内部的本地片段引用，不访问网络或外部文件，也不写库
+    schema = payload.schema_
+    try:
+        compat.make_validator(schema)
+    except SchemaError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"field": "schema", "message": f"非法 JSON Schema: {exc.message}"},
+        )
+    return refgraph.analyze_references(schema)
 
 
 @app.post(
