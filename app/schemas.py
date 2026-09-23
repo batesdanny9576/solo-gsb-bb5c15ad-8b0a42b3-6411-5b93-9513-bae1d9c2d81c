@@ -6,6 +6,7 @@ from pydantic import BaseModel, Field, model_validator
 from app.coverage import MAX_COVERAGE_DOCUMENTS
 from app.mutation import MAX_MUTATION_DOCUMENTS, MAX_RULE_LIMIT, RULE_NAMES
 from app.profile import MAX_PROFILE_DOCUMENTS
+from app.references import MAX_CYCLES
 from app.replay import MAX_REPLAY_DOCUMENTS
 
 
@@ -599,3 +600,87 @@ class MutationCoverageResponse(BaseModel):
     uncovered_paths: list[str] = Field(
         ..., description="未被样本覆盖的变异路径（存活变异体的 schema 指针，可能重复）"
     )
+
+
+# ---------------------------------------------------------------------------
+# POST /api/schemas/reference-diagnostics 引用依赖诊断
+# ---------------------------------------------------------------------------
+
+
+InvalidRefReason = Literal[
+    "external_reference_not_allowed",
+    "invalid_pointer_syntax",
+    "unresolvable_target",
+    "target_not_a_schema",
+]
+
+
+class ReferenceDiagnosticsRequest(BaseModel):
+    """POST /api/schemas/reference-diagnostics 请求体（单份 schema，不落库）。"""
+
+    schema_: dict[str, Any] = Field(
+        ...,
+        alias="schema",
+        description="待诊断的单份 JSON Schema（必须为 JSON 对象）",
+    )
+
+    model_config = {"populate_by_name": True}
+
+
+class ReferenceEdge(BaseModel):
+    """一条成功解析的文档内 ``$ref`` 引用边。"""
+
+    source: str = Field(..., description="声明 $ref 的 schema 节点位置（JSON Pointer，根为 #）")
+    target: str = Field(..., description="按 JSON Pointer 解析到的本地目标节点位置")
+    ref: str = Field(..., description="原始 $ref 字符串（# 或 #/... 片段形式）")
+
+
+class InvalidReference(BaseModel):
+    """一个无法作为本地引用解析的 ``$ref`` 定位信息。"""
+
+    source: str = Field(..., description="声明该 $ref 的 schema 节点位置（JSON Pointer）")
+    ref: str = Field(..., description="原始 $ref 值")
+    reason: InvalidRefReason = Field(..., description="失败原因代码")
+    message: str = Field(..., description="中文失败说明")
+
+
+class UnreachableDef(BaseModel):
+    """一个从有效 schema 结构经任何引用边都无法到达的 ``$defs`` 成员。"""
+
+    pointer: str = Field(..., description="$defs 成员的 JSON Pointer 位置（如 #/$defs/orphan）")
+    kind: Literal["schema", "boolean"] = Field(
+        ..., description="成员形态：对象 schema 或布尔型 schema（true/false）"
+    )
+
+
+class ReferenceDiagnosticsSummary(BaseModel):
+    total_refs: int = Field(..., ge=0, description="文档中出现的 $ref 总数（有效 + 无效）")
+    valid_edges: int = Field(..., ge=0, description="成功解析的本地引用边数量")
+    invalid_refs: int = Field(..., ge=0, description="无法作为本地引用解析的 $ref 数量")
+    unreachable_defs: int = Field(..., ge=0, description="不可达的 $defs 成员数量")
+    cycles: int = Field(..., ge=0, description=f"检测到的引用循环链数量（报告上限 {MAX_CYCLES} 条）")
+
+
+class ReferenceDiagnosticsResponse(BaseModel):
+    """单份 schema 的 $ref 引用依赖诊断结果（接口只读，不持久化任何记录）。"""
+
+    edges: list[ReferenceEdge] = Field(
+        ..., description="全部有效引用边，按 (来源, 目标, 原始引用) 排序"
+    )
+    invalid_refs: list[InvalidReference] = Field(
+        ..., description="外部引用 / 非法指针 / 目标不存在 / 目标非 schema 的 $ref 定位"
+    )
+    unreachable_defs: list[UnreachableDef] = Field(
+        ..., description="不可达的 $defs 成员，按指针排序"
+    )
+    cycles: list[list[str]] = Field(
+        ...,
+        description=(
+            "引用循环链：每条链为按引用边排列的节点指针列表，"
+            "首尾指针相同（自环为 [p, p]）；按 (链长, 节点序列) 排序"
+        ),
+    )
+    cycles_truncated: bool = Field(
+        ..., description=f"循环链超过 {MAX_CYCLES} 条上限被截断时为 true"
+    )
+    summary: ReferenceDiagnosticsSummary

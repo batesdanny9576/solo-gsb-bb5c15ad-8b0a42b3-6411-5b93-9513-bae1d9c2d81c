@@ -5,6 +5,11 @@
 组合关键字与 if/then/else 条件分支**，
 分别判断**向后兼容**与**向前兼容**，并为每一处破坏点生成**最小反例路径、反例文档和原因说明**。
 
+此外提供**单份 schema 的 `$ref` 引用依赖诊断**接口：遍历文档内全部 `$ref`，
+按 JSON Pointer 解析本地目标，返回**引用边、不可达的 `$defs` 节点、循环链与
+无效目标的定位信息**；只接受 `#` / `#/...` 片段形式的本地引用，不访问网络或
+外部文件，也不创建任何分析记录。
+
 - Web 框架：FastAPI
 - 持久化：SQLite + SQLAlchemy
 - Schema 校验：jsonschema（自动识别 draft-04 / 06 / 07 / 2019-09 / 2020-12 写法）
@@ -23,6 +28,7 @@
 │   ├── replay.py        # 样本回放诊断（旧/新双版校验 + backward/forward 分类 + 失败归因到报告 issue）
 │   ├── coverage.py      # 回放样本最小覆盖（确定性贪心集合覆盖，复用回放校验与归因选择最少代表文档）
 │   ├── mutation.py      # 样本变异覆盖评估（新 schema 单点变异确定性生成 + 逐变异校验 + 分类 mutation score）
+│   ├── references.py    # 引用依赖诊断（文档内 $ref 引用边 / 不可达 $defs / 循环链 / 无效目标）
 │   ├── compare.py       # 报告基线对比（issue 指纹 + 新增/修复/仍存/级别变化分类）
 │   ├── sarif.py         # SARIF 2.1.0 导出（issue -> result / rule / logicalLocation）
 │   ├── gate.py          # 发布门禁（方向阈值、warning 上限、issue 豁免规则）
@@ -35,6 +41,7 @@
 │   ├── test_replay.py   # 样本回放引擎单元测试（四向分类 / issue 归因 / 无法归因归并）
 │   ├── test_coverage.py # 回放最小覆盖引擎单元测试（贪心选择 / 并列排序 / 方向筛选 / 未覆盖 issue）
 │   ├── test_mutation.py # 变异覆盖引擎单元测试（单点变异生成 / 等价过滤 / 上限 / 杀死判定）
+│   ├── test_references.py # 引用依赖诊断单元测试（引用边 / 不可达 $defs / 循环链 / 无效目标）
 │   ├── test_compare.py  # 基线对比单元测试
 │   ├── test_gate.py     # 发布门禁单元测试
 │   └── test_api.py      # 接口端到端测试
@@ -50,6 +57,12 @@
 前置条件：已安装 Docker Engine 20.10+ 与 Docker Compose v2
 （`docker compose version` 可输出版本号；旧版 Compose v1 请把下文
 `docker compose` 替换为 `docker-compose`）。
+
+**一条命令构建并启动**（服务监听 **http://localhost:8000**）：
+
+```bash
+docker compose up --build
+```
 
 ### 构建并启动
 
@@ -73,6 +86,7 @@ docker compose logs -f
 | 健康检查      | http://localhost:8000/health          |
 | Swagger 文档  | http://localhost:8000/docs            |
 | OpenAPI JSON  | http://localhost:8000/openapi.json    |
+| 引用依赖诊断  | http://localhost:8000/api/schemas/reference-diagnostics （POST） |
 
 容器内置健康检查（每 10s 访问 `/health`，连续 5 次失败标记为
 `unhealthy`），可通过 `docker compose ps` 的 `STATUS` 列确认服务就绪。
@@ -85,6 +99,26 @@ curl http://localhost:8000/health
 
 # 打开 Swagger UI 可直接调试全部接口（含变异覆盖评估）
 # http://localhost:8000/docs
+```
+
+无需创建任何分析记录，直接对单份 schema 做 `$ref` 引用依赖诊断：
+
+```bash
+curl -s -X POST http://localhost:8000/api/schemas/reference-diagnostics \
+  -H "Content-Type: application/json" \
+  -d '{
+    "schema": {
+      "type": "object",
+      "properties": {"tree": {"$ref": "#/$defs/node"}},
+      "$defs": {
+        "node": {"type": "object", "properties": {
+          "kids": {"type": "array", "items": {"$ref": "#/$defs/node"}}}},
+        "orphan": {"type": "string"}
+      }
+    }
+  }' | python3 -m json.tool
+# edges: #/properties/tree -> #/$defs/node、.../items -> #/$defs/node（自循环）
+# unreachable_defs: #/$defs/orphan；cycles: [["#/$defs/node", "#/$defs/node"]]
 ```
 
 启动后可用一条脚本快速走通"创建分析 → 变异覆盖评估"：
@@ -1137,6 +1171,126 @@ curl -X POST http://localhost:8000/api/analyses/1/mutation-coverage \
 入参为空列表、超过 5000 个文档、缺少 `documents` 字段、`max_per_rule`
 含未知规则名或负数（超过 10000）时返回 `422`。
 
+### `POST /api/schemas/reference-diagnostics` — 单份 schema 的 `$ref` 引用依赖诊断
+
+接收**单份 JSON Schema**，遍历其文档内全部 `$ref`，按 **JSON Pointer**
+（RFC 6901）在本文档内解析引用目标，返回四类诊断信息：
+
+- **引用边**（`edges`）：每个成功解析的本地引用，给出声明位置、目标位置与原始引用串；
+- **不可达的 `$defs` 节点**（`unreachable_defs`）：从有效 schema 结构
+  （不进入任何 `$defs` 定义区）出发、沿引用边闭包后仍无法到达的
+  `$defs` 成员（含嵌套 `$defs` 与布尔型成员 `true`/`false`）；
+- **循环链**（`cycles`）：引用有向图上的全部**基本环**，每条链为按
+  引用边排列的节点指针列表，**首尾指针相同**（自环为 `["#/$defs/a",
+  "#/$defs/a"]`）；确定性枚举，超过 200 条时只返回前 200 条并置
+  `cycles_truncated: true`；
+- **无效目标定位**（`invalid_refs`）：逐个给出无法解析的 `$ref` 的
+  **声明位置（JSON Pointer）、原始值、原因码与中文说明**。
+
+**只接受片段形式的本地引用**（`#` 与 `#/...`），**不访问网络或外部
+文件**；外部引用只做静态标注，绝不解析。接口为**纯只读**操作，
+**不创建分析记录**、不写数据库。
+
+请求体：
+
+| 字段     | 类型   | 必填 | 说明                          |
+| -------- | ------ | ---- | ----------------------------- |
+| `schema` | object | 是   | 待诊断的单份 JSON Schema（对象） |
+
+无效引用原因码：
+
+| `reason`                        | 触发场景                                                    |
+| ------------------------------- | ----------------------------------------------------------- |
+| `external_reference_not_allowed`| 非本地片段引用：带 scheme / 非空 document 部分（`https://…`、`other.json#/…`） |
+| `invalid_pointer_syntax`       | `#foo` 形式的 plain-name fragment、`~2` 等非法 Pointer 转义、`$ref` 非字符串 |
+| `unresolvable_target`           | 指针转义合法但文档中不存在：缺键、数组越界、非数字 / 前导零下标 |
+| `target_not_a_schema`           | 目标存在但不是 JSON Schema 节点（指向字符串、数字、普通数组等） |
+
+片段按 RFC 3986 先做百分号解码、再按 RFC 6901 解析转义（如
+`%2F` 解码为分段符，而 `~1` 才表示键名中的 `/`）。
+
+```bash
+curl -X POST http://localhost:8000/api/schemas/reference-diagnostics \
+  -H "Content-Type: application/json" \
+  -d '{
+    "schema": {
+      "type": "object",
+      "properties": {
+        "tree": {"$ref": "#/$defs/node"},
+        "self": {"$ref": "#"},
+        "bad":  {"$ref": "#/$defs/missing"},
+        "web":  {"$ref": "https://example.com/s.json#/$defs/x"}
+      },
+      "$defs": {
+        "node":  {"type": "object", "properties": {
+          "kids": {"type": "array", "items": {"$ref": "#/$defs/node"}}}},
+        "orphan": {"type": "string"},
+        "a": {"$ref": "#/$defs/b"},
+        "b": {"$ref": "#/$defs/a"}
+      }
+    }
+  }'
+```
+
+响应（节选）：
+
+```json
+{
+  "edges": [
+    {"source": "#/$defs/a", "target": "#/$defs/b", "ref": "#/$defs/b"},
+    {"source": "#/$defs/b", "target": "#/$defs/a", "ref": "#/$defs/a"},
+    {"source": "#/$defs/node/properties/kids/items",
+     "target": "#/$defs/node", "ref": "#/$defs/node"},
+    {"source": "#/properties/self", "target": "#", "ref": "#"},
+    {"source": "#/properties/tree", "target": "#/$defs/node",
+     "ref": "#/$defs/node"}
+  ],
+  "invalid_refs": [
+    {"source": "#/properties/bad", "ref": "#/$defs/missing",
+     "reason": "unresolvable_target",
+     "message": "引用目标无法在本文档内解析: #/$defs/missing"},
+    {"source": "#/properties/web",
+     "ref": "https://example.com/s.json#/$defs/x",
+     "reason": "external_reference_not_allowed",
+     "message": "仅支持文档内片段引用（# 或 #/...），不访问网络或外部文件"}
+  ],
+  "unreachable_defs": [
+    {"pointer": "#/$defs/orphan", "kind": "schema"}
+  ],
+  "cycles": [
+    ["#/$defs/a", "#/$defs/b", "#/$defs/a"],
+    ["#/$defs/node", "#/$defs/node"]
+  ],
+  "cycles_truncated": false,
+  "summary": {
+    "total_refs": 7,
+    "valid_edges": 5,
+    "invalid_refs": 2,
+    "unreachable_defs": 1,
+    "cycles": 2
+  }
+}
+```
+
+说明：
+
+- `edges` 按 `(来源, 目标, 原始引用)` 排序，`invalid_refs` 按
+  `(来源, 原始引用)` 排序，`unreachable_defs` 按指针排序，
+  `cycles` 按 `(链长, 节点序列)` 排序——同一 schema 的诊断结果与
+  JSON 键顺序无关、可重复；
+- 引用边会穿透 `properties` / `items` / `prefixItems` / `allOf` /
+  `anyOf` / `oneOf` / `then` / `else` 等任意嵌套位置，也会遍历
+  `$ref` 的兄弟关键字（draft-2019-09+ 的合法写法）；
+- 可达性按**节点身份**判定：同一 schema 对象别名挂载到多个
+  `$defs` 名字时，任一位置可达即视为可达，其余不可达位置仍逐指针列出；
+- 循环检测只依据**有效边**，外部 / 无法解析的引用不参与构图；
+  即使整条环从根不可达，环本身仍会被报告（它是客观的图结构事实）；
+- 仅遍历 JSON Schema 中以 `$ref` 为键的字符串字段，不执行 schema、
+  不加载 `$id` / `$vocabulary` 等外部资源。
+
+请求体缺少 `schema` 字段或其值不是 JSON 对象（数组 / 字符串 /
+布尔 / 数字 / `null`）时返回 `422`。
+
 ### `GET /health`
 
 ```json
@@ -1191,3 +1345,17 @@ schema，而是对**新 schema 自身**做单点变异——`$ref` 预解析后�
 对每篇文档比对原 / 异校验结果，汇总出按规则分类的 mutation score、
 未覆盖变异路径与杀死变异的样例下标。整个评估无随机源、不依赖文档
 顺序，也不产生任何持久化写入。
+
+引用依赖诊断（`references.py`）与上述能力正交：它只接收**单份
+schema**，先做一次带节点身份去重的先序遍历（穿过 `$defs` 与
+`$ref` 兄弟关键字），收集全部 `$ref` 出现点与 `$defs` 成员；每个
+`$ref` 先做片段分类（外部引用 / plain-name fragment / 非法转义直接
+拒绝，绝不发起网络或文件访问），再按 RFC 6901 逐段解析本地目标
+（缺键 / 越界 / 容器类型不匹配记为不可解析，目标不是对象或布尔
+schema 记为 `target_not_a_schema`），有效引用构成"声明位置 → 目标
+位置"的引用边。不可达 `$defs` 通过"跳过所有 `$defs` 容器的结构
+遍历 + 引用边闭包（每次进入新目标继续做结构展开）"以节点身份计算；
+循环链在指针有向图上用 index-bounded DFS 枚举全部基本环（只枚举
+起点为环内最小下标的环，保证每环恰好一次），按链长与节点序列
+确定性排序，并以 200 条为硬上限防止稠密图指数膨胀。整个诊断是
+纯函数：无 IO、无随机源，也不写任何分析记录。

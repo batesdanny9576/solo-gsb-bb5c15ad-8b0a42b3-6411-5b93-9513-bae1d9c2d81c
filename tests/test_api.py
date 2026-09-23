@@ -1156,3 +1156,91 @@ def test_mutation_coverage_missing_analysis_returns_404(client):
                        json={"documents": [{}]})
     assert resp.status_code == 404
     assert resp.json()["detail"] == "分析记录不存在"
+
+
+# ---------------------------------------------------------------------------
+# POST /api/schemas/reference-diagnostics 引用依赖诊断
+# ---------------------------------------------------------------------------
+
+
+REF_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "tree": {"$ref": "#/$defs/node"},
+        "loop": {"$ref": "#"},
+        "bad": {"$ref": "#/$defs/missing"},
+        "web": {"$ref": "https://example.com/s.json#/$defs/x"},
+        "name": {"$ref": "#foo"},
+        "notschema": {"$ref": "#/required"},
+    },
+    "required": ["tree"],
+    "$defs": {
+        "node": {"type": "object", "properties": {
+            "kids": {"type": "array", "items": {"$ref": "#/$defs/node"}}}},
+        "orphan": {"type": "string"},
+        "a": {"$ref": "#/$defs/b"},
+        "b": {"$ref": "#/$defs/a"},
+    },
+}
+
+
+def test_reference_diagnostics_full_report(client):
+    resp = client.post("/api/schemas/reference-diagnostics", json={"schema": REF_SCHEMA})
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+
+    edges = {(e["source"], e["target"]) for e in data["edges"]}
+    assert ("#/properties/tree", "#/$defs/node") in edges
+    assert ("#/properties/loop", "#") in edges
+    assert ("#/$defs/node/properties/kids/items", "#/$defs/node") in edges
+    assert ("#/$defs/a", "#/$defs/b") in edges
+    assert ("#/$defs/b", "#/$defs/a") in edges
+
+    invalid = {r["source"]: r["reason"] for r in data["invalid_refs"]}
+    assert invalid["#/properties/bad"] == "unresolvable_target"
+    assert invalid["#/properties/web"] == "external_reference_not_allowed"
+    assert invalid["#/properties/name"] == "invalid_pointer_syntax"
+    assert invalid["#/properties/notschema"] == "target_not_a_schema"
+
+    assert "#/$defs/orphan" in {d["pointer"] for d in data["unreachable_defs"]}
+    assert ["#/$defs/a", "#/$defs/b", "#/$defs/a"] in data["cycles"]
+    assert data["cycles_truncated"] is False
+    assert data["summary"]["total_refs"] == data["summary"]["valid_edges"] + \
+        data["summary"]["invalid_refs"]
+    assert data["summary"]["cycles"] == len(data["cycles"])
+
+
+def test_reference_diagnostics_creates_no_records(client):
+    before = client.get("/api/analyses").json()["total"]
+    resp = client.post("/api/schemas/reference-diagnostics", json={"schema": REF_SCHEMA})
+    assert resp.status_code == 200
+    after = client.get("/api/analyses").json()["total"]
+    assert after == before
+
+
+def test_reference_diagnostics_empty_schema(client):
+    resp = client.post("/api/schemas/reference-diagnostics",
+                       json={"schema": {"type": "object"}})
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["edges"] == []
+    assert data["invalid_refs"] == []
+    assert data["unreachable_defs"] == []
+    assert data["cycles"] == []
+    assert data["summary"]["total_refs"] == 0
+
+
+def test_reference_diagnostics_validation_errors(client):
+    # schema 必须是 JSON 对象
+    assert client.post("/api/schemas/reference-diagnostics",
+                       json={"schema": True}).status_code == 422
+    assert client.post("/api/schemas/reference-diagnostics",
+                       json={"schema": [1, 2]}).status_code == 422
+    # 缺少 schema 字段
+    assert client.post("/api/schemas/reference-diagnostics", json={}).status_code == 422
+
+
+def test_reference_diagnostics_is_gettable_in_openapi(client):
+    resp = client.get("/openapi.json")
+    assert resp.status_code == 200
+    assert "/api/schemas/reference-diagnostics" in resp.json()["paths"]

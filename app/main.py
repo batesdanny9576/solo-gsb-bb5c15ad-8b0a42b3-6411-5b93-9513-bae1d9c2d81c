@@ -7,7 +7,7 @@ from jsonschema.exceptions import SchemaError
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app import compat, compare, coverage, gate, mutation, profile, replay, sarif
+from app import compat, compare, coverage, gate, mutation, profile, references, replay, sarif
 from app.database import get_db, init_db
 from app.models import Analysis, AnalysisProfile
 from app.schemas import (
@@ -23,6 +23,8 @@ from app.schemas import (
     ProfileCreate,
     ProfileListResponse,
     ProfileResponse,
+    ReferenceDiagnosticsRequest,
+    ReferenceDiagnosticsResponse,
     ReplayRequest,
     ReplayResponse,
     ReplayCoverageRequest,
@@ -55,6 +57,23 @@ def root():
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+# ---------------------------------------------------------------------------
+# 单份 schema 静态诊断（不落库、不访问网络 / 外部文件）
+# ---------------------------------------------------------------------------
+
+
+@app.post(
+    "/api/schemas/reference-diagnostics",
+    response_model=ReferenceDiagnosticsResponse,
+    tags=["schemas"],
+    summary="引用依赖诊断：遍历单份 schema 的内部 $ref 并报告边 / 不可达 $defs / 循环 / 无效目标",
+)
+def reference_diagnostics(payload: ReferenceDiagnosticsRequest):
+    # 纯静态分析：只解析 # 与 #/... 形式的文档内 JSON Pointer 引用，
+    # 不访问网络或外部文件，也不创建任何分析记录
+    return references.diagnose_references(payload.schema_)
 
 
 @app.post(
